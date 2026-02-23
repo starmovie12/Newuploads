@@ -3,20 +3,7 @@ export const maxDuration = 60; // Allow up to 60s for Vercel Pro (default is 10s
 
 import { NextResponse } from 'next/server';
 import { db } from '@/lib/firebaseAdmin';
-import {
-  extractMovieLinks,
-  solveHBLinks,
-  solveHubCDN,
-  solveHubDrive,
-} from '@/lib/solvers';
-
-const API_MAP = {
-  timer: 'https://time-page-bay-pass-edhc.onrender.com/solve?url=',
-  hblinks: 'https://hblinks-dad.onrender.com/solve?url=',
-  hubdrive: 'https://hdhub4u-1.onrender.com/solve?url=',
-  hubcloud: 'http://85.121.5.246:5000/solve?url=',
-  hubcdn_bypass: 'https://hubcdn-bypass.onrender.com/extract?url=',
-};
+import { extractMovieLinks } from '@/lib/solvers';
 
 // =============================================
 // HELPER: Telegram Alert
@@ -58,10 +45,9 @@ export async function GET() {
 }
 
 // =============================================
-// POST /api/tasks — Create or merge a scraping task
+// POST /api/tasks — Create or merge/retry a scraping task
 // =============================================
 export async function POST(req: Request) {
-  // ---- Step 1: Parse request body safely ----
   let url: string;
   try {
     const body = await req.json();
@@ -81,10 +67,6 @@ export async function POST(req: Request) {
   const trimmedUrl = url.trim();
 
   try {
-    // ---- Step 2: Duplicate check ----
-    // FIX: Use a SIMPLE query (single field) to avoid requiring a Firestore composite index.
-    // The old code used .where('url', '==', ...).orderBy('createdAt', 'desc') which
-    // REQUIRES a composite index. Without it, Firestore throws an error instantly → 500.
     let existingTaskId: string | null = null;
     let existingTaskData: any = null;
 
@@ -92,11 +74,10 @@ export async function POST(req: Request) {
       const existingSnapshot = await db
         .collection('scraping_tasks')
         .where('url', '==', trimmedUrl)
-        .limit(5) // Get a few, we'll sort client-side
+        .limit(5) 
         .get();
 
       if (!existingSnapshot.empty) {
-        // Sort client-side by createdAt descending to get the most recent
         const sorted = existingSnapshot.docs
           .map((doc) => ({ id: doc.id, data: doc.data() }))
           .sort((a, b) => {
@@ -109,15 +90,12 @@ export async function POST(req: Request) {
         existingTaskData = sorted[0].data;
       }
     } catch (dupCheckErr: any) {
-      // If duplicate check fails (e.g., missing index), log but continue.
-      // We'll just create a new task instead of crashing.
       console.warn('[POST /api/tasks] Duplicate check failed, creating new task:', dupCheckErr.message);
     }
 
-    // ---- Step 3: Extract links from the source page ----
     const listResult = await extractMovieLinks(trimmedUrl);
 
-    // ---- Step 4: If duplicate exists, merge ----
+    // ---- Step 4: If duplicate exists, Merge or Retry ----
     if (existingTaskId && existingTaskData) {
       if (listResult.status === 'success' && listResult.links) {
         const existingLinks: any[] = existingTaskData.links || [];
@@ -125,24 +103,30 @@ export async function POST(req: Request) {
 
         const newLinksToAdd = listResult.links
           .filter((l: any) => !existingLinkUrls.has(l.link))
-          .map((l: any) => ({ ...l, status: 'processing', logs: [] }));
+          .map((l: any) => ({ ...l, status: 'pending', logs: [] }));
 
-        if (newLinksToAdd.length > 0) {
-          const mergedLinks = [...existingLinks, ...newLinksToAdd];
-          await db.collection('scraping_tasks').doc(existingTaskId).update({
-            status: 'processing',
-            links: mergedLinks,
-            metadata: listResult.metadata || existingTaskData.metadata,
-            preview: listResult.preview || existingTaskData.preview,
-            updatedAt: new Date().toISOString(),
-          });
+        // FIX FOR RETRY BUG: Reset any failed/error links back to pending automatically
+        const updatedExistingLinks = existingLinks.map((l: any) => {
+          if (l.status === 'error' || l.status === 'failed') {
+            return { 
+              ...l, 
+              status: 'pending', 
+              logs: [{ msg: '🔄 Retrying...', type: 'info' }] 
+            };
+          }
+          return l;
+        });
 
-          // Fire-and-forget background solving (won't survive Vercel response cutoff,
-          // but stream_solve handles the real work via SSE)
-          runBackgroundSolving(existingTaskId, newLinksToAdd, trimmedUrl, existingLinks.length).catch(
-            (err) => console.error('[BG Solve Merge] Error:', err.message)
-          );
-        }
+        const mergedLinks = [...updatedExistingLinks, ...newLinksToAdd];
+
+        await db.collection('scraping_tasks').doc(existingTaskId).update({
+          status: 'processing', // Ensure task is active again for stream_solve
+          error: null, // Clear past errors
+          links: mergedLinks,
+          metadata: listResult.metadata || existingTaskData.metadata,
+          preview: listResult.preview || existingTaskData.preview,
+          updatedAt: new Date().toISOString(),
+        });
 
         return NextResponse.json({
           taskId: existingTaskId,
@@ -150,10 +134,10 @@ export async function POST(req: Request) {
           preview: listResult.preview,
           merged: true,
           newLinksAdded: newLinksToAdd.length,
+          note: 'Task reset for retry successfully'
         });
       }
 
-      // No new links, return existing
       return NextResponse.json({
         taskId: existingTaskId,
         metadata: existingTaskData.metadata,
@@ -174,7 +158,7 @@ export async function POST(req: Request) {
         listResult.status === 'success' && listResult.links
           ? listResult.links.map((l: any) => ({
               ...l,
-              status: 'processing',
+              status: 'pending', // Set to pending so stream_solve can pick it up
               logs: [{ msg: '🔍 Queued for processing...', type: 'info' }],
             }))
           : [],
@@ -183,13 +167,7 @@ export async function POST(req: Request) {
     const taskRef = await db.collection('scraping_tasks').add(taskData);
     const taskId = taskRef.id;
 
-    if (listResult.status === 'success' && listResult.links) {
-      runBackgroundSolving(taskId, listResult.links, trimmedUrl).catch((err) =>
-        console.error('[BG Solve New] Error:', err.message)
-      );
-    } else if (listResult.status === 'success') {
-      await taskRef.update({ status: 'failed', error: 'No links found on page' });
-    } else {
+    if (listResult.status !== 'success' || !listResult.links) {
       await taskRef.update({
         status: 'failed',
         error: listResult.message || 'Extraction failed',
@@ -212,197 +190,36 @@ export async function POST(req: Request) {
 // DELETE /api/tasks — Delete a task from Firestore
 // =============================================
 export async function DELETE(req: Request) {
-  let taskId: string;
   try {
-    const body = await req.json();
-    taskId = body?.taskId;
-  } catch (parseError: any) {
-    console.error('[DELETE /api/tasks] JSON parse error:', parseError.message);
-    return NextResponse.json(
-      { error: 'Invalid JSON in request body' },
-      { status: 400 }
-    );
-  }
+    let taskId: string | null = null;
+    
+    // Support URL search params fallback (e.g., /api/tasks?taskId=123)
+    const url = new URL(req.url);
+    taskId = url.searchParams.get('taskId');
 
-  if (!taskId || typeof taskId !== 'string') {
-    return NextResponse.json({ error: 'taskId is required' }, { status: 400 });
-  }
+    // If not in URL, check JSON body safely
+    if (!taskId) {
+      const body = await req.json().catch(() => ({}));
+      taskId = body?.taskId;
+    }
 
-  try {
+    if (!taskId) {
+      return NextResponse.json({ error: 'taskId is required' }, { status: 400 });
+    }
+
     const docRef = db.collection('scraping_tasks').doc(taskId);
     const doc = await docRef.get();
 
     if (!doc.exists) {
-      return NextResponse.json({ error: 'Task not found' }, { status: 404 });
+      // If already deleted, return success so UI updates smoothly
+      return NextResponse.json({ success: true, deletedId: taskId, note: 'Task not found or already deleted' });
     }
 
     await docRef.delete();
     return NextResponse.json({ success: true, deletedId: taskId });
   } catch (e: any) {
     console.error('[DELETE /api/tasks] Error:', e.message);
-    return NextResponse.json({ error: e.message }, { status: 500 });
-  }
-}
-
-// =============================================
-// Background solving pipeline
-// =============================================
-async function runBackgroundSolving(
-  taskId: string,
-  links: any[],
-  sourceUrl: string,
-  startIdx: number = 0
-) {
-  const taskRef = db.collection('scraping_tasks').doc(taskId);
-
-  try {
-    const solvedLinks = await Promise.all(
-      links.map(async (linkData: any) => {
-        let currentLink = linkData.link;
-        const logs: { msg: string; type: string }[] = [];
-
-        const addLog = (msg: string, type: string = 'info') => {
-          logs.push({ msg, type });
-        };
-
-        const fetchWithUA = (url: string) =>
-          fetch(url, {
-            headers: {
-              'User-Agent':
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            },
-          });
-
-        try {
-          addLog('🔍 Analyzing Link...', 'info');
-
-          // --- HubCDN Bypass ---
-          if (currentLink.includes('hubcdn.fans')) {
-            addLog('⚡ HubCDN Detected! Processing...', 'info');
-            const r = await solveHubCDN(currentLink);
-            if (r.status === 'success') {
-              addLog('🎉 Direct Link Found!', 'success');
-              return { ...linkData, finalLink: r.final_link, status: 'done', logs };
-            } else {
-              addLog(`❌ HubCDN Error: ${r.message}`, 'error');
-              return { ...linkData, status: 'error', error: r.message, logs };
-            }
-          }
-
-          // --- Timer Bypass ---
-          const targetDomains = ['hblinks', 'hubdrive', 'hubcdn', 'hubcloud'];
-          let loopCount = 0;
-          while (loopCount < 3 && !targetDomains.some((d) => currentLink.includes(d))) {
-            const isTimerPage = ['gadgetsweb', 'review-tech', 'ngwin', 'cryptoinsights'].some((x) =>
-              currentLink.includes(x)
-            );
-            if (!isTimerPage && loopCount === 0) break;
-
-            addLog('⏳ Timer Detected. Bypassing...', 'warn');
-            try {
-              const r = await fetchWithUA(
-                API_MAP.timer + encodeURIComponent(currentLink)
-              ).then((res) => res.json());
-              if (r.status === 'success') {
-                currentLink = r.extracted_link!;
-                addLog('✅ Timer Bypassed', 'success');
-              } else {
-                addLog(`❌ Timer Error: ${r.message || 'Failed'}`, 'error');
-                break;
-              }
-            } catch (e: any) {
-              addLog(`❌ Timer Error: ${e.message}`, 'error');
-              break;
-            }
-            loopCount++;
-          }
-
-          // --- HBLinks ---
-          if (currentLink.includes('hblinks')) {
-            addLog('🔗 Solving HBLinks...', 'info');
-            const r = await solveHBLinks(currentLink);
-            if (r.status === 'success') {
-              currentLink = r.link!;
-              addLog('✅ HBLinks Solved', 'success');
-            } else {
-              addLog(`❌ HBLinks Error: ${r.message}`, 'error');
-              return { ...linkData, status: 'error', error: r.message, logs };
-            }
-          }
-
-          // --- HubDrive ---
-          if (currentLink.includes('hubdrive')) {
-            addLog('☁️ Solving HubDrive...', 'info');
-            const r = await solveHubDrive(currentLink);
-            if (r.status === 'success') {
-              currentLink = r.link!;
-              addLog('✅ HubDrive Solved', 'success');
-            } else {
-              addLog(`❌ HubDrive Error: ${r.message}`, 'error');
-              return { ...linkData, status: 'error', error: r.message, logs };
-            }
-          }
-
-          // --- Final HubCloud ---
-          if (currentLink.includes('hubcloud') || currentLink.includes('hubcdn')) {
-            addLog('⚡ Getting Direct Link...', 'info');
-            try {
-              const r = await fetchWithUA(
-                API_MAP.hubcloud + encodeURIComponent(currentLink)
-              ).then((res) => res.json());
-              if (r.status === 'success') {
-                addLog('🎉 COMPLETED - Link Extracted!', 'success');
-                return { ...linkData, finalLink: r.link, status: 'done', logs };
-              } else {
-                addLog('❌ HubCloud API Failed', 'error');
-              }
-            } catch (e: any) {
-              addLog(`❌ HubCloud Error: ${e.message}`, 'error');
-            }
-          }
-
-          addLog('❌ Could not extract final link', 'error');
-          return { ...linkData, status: 'error', error: 'Could not solve', logs };
-        } catch (e: any) {
-          addLog(`⚠️ Critical Error: ${e.message}`, 'error');
-          return { ...linkData, status: 'error', error: e.message, logs };
-        }
-      })
-    );
-
-    // Persist to Firebase
-    if (startIdx > 0) {
-      const currentDoc = await taskRef.get();
-      const currentData = currentDoc.data();
-      if (currentData) {
-        const existingLinks = currentData.links || [];
-        const mergedLinks = [...existingLinks.slice(0, startIdx), ...solvedLinks];
-        await taskRef.update({
-          status: 'completed',
-          links: mergedLinks,
-          completedAt: new Date().toISOString(),
-        });
-      }
-    } else {
-      await taskRef.update({
-        status: 'completed',
-        links: solvedLinks,
-        completedAt: new Date().toISOString(),
-      });
-    }
-  } catch (e: any) {
-    console.error(`[BackgroundSolving] Pipeline error for task ${taskId}:`, e.message);
-
-    try {
-      await taskRef.update({
-        status: 'failed',
-        error: e.message,
-        failedAt: new Date().toISOString(),
-      });
-    } catch (_) {
-      console.error('[BackgroundSolving] Could not update task status to failed');
-    }
-
-    sendTelegramAlert(sourceUrl, e.message).catch(() => {});
+    // Return 200 with error flag to prevent UI crashing
+    return NextResponse.json({ success: false, error: e.message }, { status: 200 });
   }
 }
