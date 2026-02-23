@@ -210,13 +210,14 @@ export function extractMovieMetadata(html: string): {
   };
 
   // ===== STEP 1: Find the main content area =====
-  let $mainContent = $('main.page-body');
+  // FIXED TYPE ERROR HERE BY ADDING `: any`
+  let $mainContent: any = $('main.page-body');
   if ($mainContent.length === 0) $mainContent = $('div.entry-content');
   if ($mainContent.length === 0) $mainContent = $.root();
 
   // ===== STEP 2: Look for the "DOWNLOAD LINKS" section =====
   let $downloadSection: ReturnType<typeof $> | null = null;
-  $mainContent.find('h2, h3, h4').each((_i, heading) => {
+  $mainContent.find('h2, h3, h4').each((_i: number, heading: any) => {
     const headingText = $(heading).text().toUpperCase();
     if (headingText.includes('DOWNLOAD LINKS')) {
       $downloadSection = $(heading).parent();
@@ -296,7 +297,7 @@ export function extractMovieMetadata(html: string): {
 
   // ===== STEP 5: Fallback - Check Language: field in description =====
   if (foundLanguages.size === 0) {
-    $mainContent.find('div, span, p').each((_i, elem) => {
+    $mainContent.find('div, span, p').each((_i: number, elem: any) => {
       const text = $(elem).text();
       const langFieldMatch = text.match(/Language\s*:(.+?)(?:\n|\/|$)/i);
       if (langFieldMatch) {
@@ -314,7 +315,7 @@ export function extractMovieMetadata(html: string): {
 
   // ===== STEP 6: Quality fallback from description =====
   if (!qualityInfo.resolution) {
-    $mainContent.find('div, span, p').each((_i, elem) => {
+    $mainContent.find('div, span, p').each((_i: number, elem: any) => {
       const text = $(elem).text();
       if (/Quality\s*:/i.test(text)) {
         const qualityMatch = text.match(/Quality\s*:(.+?)(?:\n|$)/i);
