@@ -37,6 +37,7 @@ export async function solveHBLinks(url: string) {
 
 /**
  * Junk link text patterns to filter out - case insensitive matching
+ * Includes fake resolution/codec buttons that redirect to ads
  */
 const JUNK_LINK_TEXTS = [
   "how to download",
@@ -46,6 +47,21 @@ const JUNK_LINK_TEXTS = [
   "join telegram",
   "join our telegram",
   "request movie",
+  // Step 1 Fix: Fake resolution/codec ad buttons
+  "4k | sdr | hevc",
+  "4k | sdr",
+  "sdr | hevc",
+];
+
+/**
+ * Exact-match junk texts — standalone fake button labels (case-insensitive).
+ * These are filtered by exact match (after trim + lowercase) to avoid 
+ * accidentally blocking legitimate links that contain "4K" in longer text like "480p/720p/1080p/4K".
+ */
+const JUNK_LINK_EXACT_TEXTS = [
+  "4k",
+  "sdr",
+  "hevc",
 ];
 
 /**
@@ -53,7 +69,11 @@ const JUNK_LINK_TEXTS = [
  */
 function isJunkLink(text: string): boolean {
   const lower = text.toLowerCase().trim();
-  return JUNK_LINK_TEXTS.some(junk => lower.includes(junk));
+  // Partial/includes match
+  if (JUNK_LINK_TEXTS.some(junk => lower.includes(junk))) return true;
+  // Exact match for standalone fake buttons
+  if (JUNK_LINK_EXACT_TEXTS.some(junk => lower === junk)) return true;
+  return false;
 }
 
 /**
