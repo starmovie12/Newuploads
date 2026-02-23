@@ -46,8 +46,8 @@ export async function POST(req: Request) {
 
       const finalResults: Map<number, any> = new Map();
 
-      const processLink = async (linkData: any) => {
-        const lid = linkData.id;
+      const processLink = async (linkData: any, idx: number) => {
+        const lid = linkData.id || idx; // Support both format types
         let currentLink = linkData.link;
         const logs: { msg: string; type: string }[] = [];
 
@@ -78,12 +78,12 @@ export async function POST(req: Request) {
               if (r.status === 'success') {
                 sendLog('🎉 COMPLETED: Direct Link Found', 'success');
                 send({ id: lid, final: r.final_link, status: 'done' });
-                finalResults.set(lid, { ...linkData, finalLink: r.final_link, status: 'done', logs });
+                finalResults.set(idx, { ...linkData, finalLink: r.final_link, status: 'done', logs });
                 return;
               } else throw new Error(r.message || 'HubCDN Native Failed');
             } catch (e: any) {
               sendLog(`❌ HubCDN Error: ${e.message}`, 'error');
-              finalResults.set(lid, { ...linkData, status: 'error', error: e.message, logs });
+              finalResults.set(idx, { ...linkData, status: 'error', error: e.message, logs });
               return;
             }
           }
@@ -136,7 +136,7 @@ export async function POST(req: Request) {
               } else throw new Error(r.message || 'HBLinks Native Failed');
             } catch (e: any) {
               sendLog(`❌ HBLinks Error: ${e.message}`, 'error');
-              finalResults.set(lid, { ...linkData, status: 'error', error: e.message, logs });
+              finalResults.set(idx, { ...linkData, status: 'error', error: e.message, logs });
               return;
             }
           }
@@ -153,7 +153,7 @@ export async function POST(req: Request) {
               } else throw new Error(r.message || 'HubDrive Native Failed');
             } catch (e: any) {
               sendLog(`❌ HubDrive Error: ${e.message}`, 'error');
-              finalResults.set(lid, { ...linkData, status: 'error', error: e.message, logs });
+              finalResults.set(idx, { ...linkData, status: 'error', error: e.message, logs });
               return;
             }
           }
@@ -169,8 +169,9 @@ export async function POST(req: Request) {
               if (r.status === 'success') {
                 sendLog('🎉 COMPLETED', 'success');
                 send({ id: lid, final: r.link, status: 'done' });
-                finalResults.set(lid, { ...linkData, finalLink: r.link, status: 'done', logs });
+                finalResults.set(idx, { ...linkData, finalLink: r.link, status: 'done', logs });
                 finalFound = true;
+                return; // End here on success
               } else throw new Error('HubCloud API Failed');
             } catch (e: any) {
               sendLog(`❌ HubCloud Error: ${e.message}`, 'error');
@@ -181,18 +182,18 @@ export async function POST(req: Request) {
           if (!finalFound) {
             sendLog('❌ Unrecognized link format or stuck', 'error');
             send({ id: lid, status: 'error', msg: 'Process ended without final link' });
-            finalResults.set(lid, { ...linkData, status: 'error', error: 'Could not solve', logs });
+            finalResults.set(idx, { ...linkData, status: 'error', error: 'Could not solve', logs });
           }
         } catch (e: any) {
           sendLog(`⚠️ Critical Error: ${e.message}`, 'error');
-          finalResults.set(lid, { ...linkData, status: 'error', error: e.message, logs });
+          finalResults.set(idx, { ...linkData, status: 'error', error: e.message, logs });
         } finally {
           send({ id: lid, status: 'finished' });
         }
       };
 
       // Process all links concurrently
-      await Promise.all(links.map((link: any) => processLink(link)));
+      await Promise.all(links.map((link: any, idx: number) => processLink(link, idx)));
 
       // ===== PERSIST TO FIREBASE =====
       if (taskId) {
@@ -203,18 +204,30 @@ export async function POST(req: Request) {
             const taskData = taskDoc.data();
             const existingLinks = taskData?.links || [];
 
-            const updatedLinks = existingLinks.map((existingLink: any, idx: number) => {
-              const result = finalResults.get(idx);
-              if (result) {
+            // We must map over existing links and update ONLY the ones we just solved.
+            // But we didn't receive all existing links in the POST payload.
+            // This is why Claude's version was failing - it assumed idx was linear.
+            // To fix this, we update based on matching the original URL.
+            const updatedLinks = existingLinks.map((existingLink: any) => {
+              // Find the result that matches this link's original URL
+              let matchingResult = null;
+              for (const [key, value] of finalResults.entries()) {
+                 if (value.link === existingLink.link) {
+                     matchingResult = value;
+                     break;
+                 }
+              }
+
+              if (matchingResult) {
                 return {
                   ...existingLink,
-                  finalLink: result.finalLink || null,
-                  status: result.status || 'error',
-                  error: result.error || null,
-                  logs: result.logs || [],
+                  finalLink: matchingResult.finalLink || null,
+                  status: matchingResult.status || 'error',
+                  error: matchingResult.error || null,
+                  logs: matchingResult.logs || [],
                 };
               }
-              return existingLink;
+              return existingLink; // Keep unchanged
             });
 
             await taskRef.update({
