@@ -283,8 +283,9 @@ export function extractMovieMetadata(html: string): {
   });
 
   // ===== STEP 4: Check for MULTi audio line =====
+  // FIXED TYPE ERROR HERE BY CHANGING REGEX FLAG
   const pageText = ($downloadSection as ReturnType<typeof $>).text();
-  const multiMatch = pageText.match(/MULTi.*?\[(.*?HINDI.*?)\]/is);
+  const multiMatch = pageText.match(/MULTi[\s\S]*?\[([\s\S]*?HINDI[\s\S]*?)\]/i);
   if (multiMatch) {
     const langString = multiMatch[1];
     for (const lang of validLangs) {
