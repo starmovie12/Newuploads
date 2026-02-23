@@ -209,6 +209,42 @@ export async function POST(req: Request) {
 }
 
 // =============================================
+// DELETE /api/tasks — Delete a task from Firestore
+// =============================================
+export async function DELETE(req: Request) {
+  let taskId: string;
+  try {
+    const body = await req.json();
+    taskId = body?.taskId;
+  } catch (parseError: any) {
+    console.error('[DELETE /api/tasks] JSON parse error:', parseError.message);
+    return NextResponse.json(
+      { error: 'Invalid JSON in request body' },
+      { status: 400 }
+    );
+  }
+
+  if (!taskId || typeof taskId !== 'string') {
+    return NextResponse.json({ error: 'taskId is required' }, { status: 400 });
+  }
+
+  try {
+    const docRef = db.collection('scraping_tasks').doc(taskId);
+    const doc = await docRef.get();
+
+    if (!doc.exists) {
+      return NextResponse.json({ error: 'Task not found' }, { status: 404 });
+    }
+
+    await docRef.delete();
+    return NextResponse.json({ success: true, deletedId: taskId });
+  } catch (e: any) {
+    console.error('[DELETE /api/tasks] Error:', e.message);
+    return NextResponse.json({ error: e.message }, { status: 500 });
+  }
+}
+
+// =============================================
 // Background solving pipeline
 // =============================================
 async function runBackgroundSolving(
